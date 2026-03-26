@@ -9,6 +9,7 @@ venv/
 ENV/
 
 # Credentials
+.env
 *.env
 *.key
 **/keys/* 
@@ -23,6 +24,7 @@ orchestration/airflow-dataflow/keys/airflow-dataflow-key.json
 
 # Logs
 *.log
+orchestration/logs/
 
 # Local development
 .DS_Store

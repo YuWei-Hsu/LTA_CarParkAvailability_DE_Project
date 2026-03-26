@@ -9,6 +9,15 @@ from airflow.providers.google.cloud.operators.dataflow import DataflowStartFlexT
 from google.cloud import storage
 from airflow.models import Variable
 
+PROJECT_ID = "lta-carpark-489300"
+BUCKET_NAME = "lta-carpark-489300"
+BQ_RAW_TABLE = f"{PROJECT_ID}:carpark_raw.carpark_availability"
+REGION = "us-west1"
+SERVICE_ACCOUNT_EMAIL = "lta-carpark-pipeline@lta-carpark-489300.iam.gserviceaccount.com"
+NETWORK = "default"
+SUBNETWORK = f"regions/{REGION}/subnetworks/default"
+WORKER_ZONE = "us-west1-c"
+
 
 # Default parameters
 default_args = {
@@ -20,16 +29,17 @@ default_args = {
     'retry_delay': timedelta(minutes=5),
 }
 
-# DAG definition
+# DAG definition (Kafka 版本：避免與非 Kafka 版 dag_id 衝突)
 @dag(
+    dag_id="lta_carpark_pipeline_kafka",
     default_args=default_args,
-    description='LTA Carpark Availability Pipeline',
+    description='LTA Carpark Availability Pipeline (Kafka)',
     schedule_interval=timedelta(minutes=5),  # Run once every 5 minutes
     start_date=datetime(2025, 3, 27),
     catchup=False,
-    tags=['carpark', 'lta', 'availability'],
+    tags=['carpark', 'lta', 'availability', 'kafka'],
 )
-def lta_carpark_pipeline():
+def lta_carpark_pipeline_kafka():
     """
     LTA Parking Availability ETL Pipeline:
 
@@ -53,7 +63,9 @@ def lta_carpark_pipeline():
         url = base_url + endpoint
         
         # API Key
-        api_key = Variable.get("lta_api_key")
+        api_key = Variable.get("lta_api_key", default_var=os.getenv("LTA_API_KEY"))
+        if not api_key:
+            raise ValueError("Missing API key. Set Airflow Variable 'lta_api_key' or env var LTA_API_KEY.")
         
         # Prepare request headers
         headers = {'AccountKey': api_key, 'accept': 'application/json'}
@@ -107,28 +119,29 @@ def lta_carpark_pipeline():
     # Step 2: Use the Dataflow template to write Kafka data to GCS
     kafka_to_gcs = DataflowStartFlexTemplateOperator(
         task_id="kafka_to_gcs_dataflow",
-        project_id="lta-caravailability",
-        location="asia-southeast1",
+        project_id=PROJECT_ID,
+        location=REGION,
         wait_until_finished=True,
         body={
             "launchParameter": {
-                "containerSpecGcsPath": "gs://dataflow-templates-asia-southeast1/latest/flex/Kafka_to_Gcs_Flex",
+                "containerSpecGcsPath": "gs://dataflow-templates-us-west1/latest/flex/Kafka_to_Gcs_Flex",
                 "jobName": "kafka-to-gcs-job",
                 "parameters": {
                     "readBootstrapServerAndTopic": "34.126.86.205:9093,carpark-availability",
-                    "outputDirectory": "gs://lta-carpark/carpark-data/",
+                    "outputDirectory": f"gs://{BUCKET_NAME}/carpark-data/",
                     "outputFilenamePrefix": "carpark-",
                     "windowDuration": "5m",
                     "kafkaReadAuthenticationMode": "NONE",
                     "messageFormat": "JSON",
                     "useBigQueryDLQ": "false",
-                    "tempLocation": "gs://lta-carpark/temp/"
+                    "tempLocation": f"gs://{BUCKET_NAME}/temp/"
                 },
 
                 "environment": {
-                    "network": "default",
-                    "subnetwork": "regions/asia-southeast1/subnetworks/default",
-                    "workerZone": "asia-southeast1-c"
+                    "network": NETWORK,
+                    "subnetwork": SUBNETWORK,
+                    "workerZone": WORKER_ZONE,
+                    "serviceAccountEmail": SERVICE_ACCOUNT_EMAIL
                 }
         }
         }
@@ -153,7 +166,7 @@ def lta_carpark_pipeline():
         
         # Upload to GCS
         client = storage.Client()
-        bucket = client.bucket("lta-carpark")
+        bucket = client.bucket(BUCKET_NAME)
         blob = bucket.blob("scripts/transform.js")
         blob.upload_from_string(transform_script)
         
@@ -178,8 +191,8 @@ def lta_carpark_pipeline():
         schema_blob.upload_from_string(json.dumps(schema_json))
         
         return {
-            "transform_path": "gs://lta-carpark/scripts/transform.js",
-            "schema_path": "gs://lta-carpark/schemas/carpark_schema.json"
+            "transform_path": f"gs://{BUCKET_NAME}/scripts/transform.js",
+            "schema_path": f"gs://{BUCKET_NAME}/schemas/carpark_schema.json"
         }
     
     # Step 4: Use the Dataflow template to load GCS data into BigQuery
@@ -190,27 +203,28 @@ def lta_carpark_pipeline():
         
         gcs_to_bigquery = DataflowStartFlexTemplateOperator(
             task_id="gcs_to_bigquery_dataflow",
-            project_id="lta-caravailability",
-            location="asia-southeast1",
+            project_id=PROJECT_ID,
+            location=REGION,
             wait_until_finished=False,  # Do not wait for completion, avoid resource issues blocking Airflow
             body={
                 "launchParameter": {
-                    "containerSpecGcsPath": "gs://dataflow-templates-asia-southeast1/latest/flex/GCS_Text_to_BigQuery_Flex",
+                    "containerSpecGcsPath": "gs://dataflow-templates-us-west1/latest/flex/GCS_Text_to_BigQuery_Flex",
                     "jobName": "gcs-to-bq-job",
                     "parameters": {
                         "javascriptTextTransformFunctionName": "transform",
                         "javascriptTextTransformGcsPath": script_paths["transform_path"],
                         "JSONPath": script_paths["schema_path"],
-                        "inputFilePattern": "gs://lta-carpark/carpark-data/carpark-*.json",
-                        "outputTable": "lta-caravailability:carpark_raw.carpark_availability",
-                        "bigQueryLoadingTemporaryDirectory": "gs://lta-carpark/temp/",
-                        "tempLocation": "gs://lta-carpark/temp/"
+                        "inputFilePattern": f"gs://{BUCKET_NAME}/carpark-data/carpark-*.json",
+                        "outputTable": BQ_RAW_TABLE,
+                        "bigQueryLoadingTemporaryDirectory": f"gs://{BUCKET_NAME}/temp/",
+                        "tempLocation": f"gs://{BUCKET_NAME}/temp/"
                     }
                 },
                 "environment": {
-                    "network": "default",
-                    "subnetwork": "regions/asia-southeast1/subnetworks/default",
-                    "workerZone": "asia-southeast1-c"
+                    "network": NETWORK,
+                    "subnetwork": SUBNETWORK,
+                    "workerZone": WORKER_ZONE,
+                    "serviceAccountEmail": SERVICE_ACCOUNT_EMAIL
                 }
             }
         )
@@ -226,4 +240,4 @@ def lta_carpark_pipeline():
     fetch_kafka >> kafka_to_gcs >> transform_files >> start_gcs_to_bigquery(transform_files)
 
 # Instantiate DAG
-carpark_dag = lta_carpark_pipeline()
+carpark_dag = lta_carpark_pipeline_kafka()

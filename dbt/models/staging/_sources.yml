@@ -2,7 +2,7 @@ version: 2
 
 sources:
   - name: raw
-    database: "{{ env_var('DBT_DATABASE', 'lta-caravailability') }}"
+    database: "{{ env_var('DBT_DATABASE', 'lta-carpark-489300') }}"
     schema: "{{ env_var('DBT_SCHEMA', 'carpark_raw') }}"
     tables:
       - name: carpark_availability

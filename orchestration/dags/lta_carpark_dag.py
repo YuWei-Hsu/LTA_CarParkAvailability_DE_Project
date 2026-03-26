@@ -10,6 +10,15 @@ from airflow.providers.google.cloud.operators.bigquery import BigQueryExecuteQue
 from google.cloud import storage
 from airflow.models import Variable
 
+PROJECT_ID = "lta-carpark-489300"
+BUCKET_NAME = "lta-carpark-489300"
+BQ_RAW_TABLE = f"{PROJECT_ID}:carpark_raw.carpark_availability"
+REGION = "us-west1"
+SERVICE_ACCOUNT_EMAIL = "lta-carpark-pipeline@lta-carpark-489300.iam.gserviceaccount.com"
+NETWORK = "default"
+SUBNETWORK = f"regions/{REGION}/subnetworks/default"
+WORKER_ZONE = "us-west1-c"
+
 
 # Default arguments
 default_args = {
@@ -54,7 +63,9 @@ def lta_carpark_pipeline():
         url = base_url + endpoint
         
         # API key
-        api_key = Variable.get("lta_api_key")
+        api_key = Variable.get("lta_api_key", default_var=os.getenv("LTA_API_KEY"))
+        if not api_key:
+            raise ValueError("Missing API key. Set Airflow Variable 'lta_api_key' or env var LTA_API_KEY.")
         
         # Prepare headers
         headers = {'AccountKey': api_key, 'accept': 'application/json'}
@@ -69,10 +80,15 @@ def lta_carpark_pipeline():
             carparks = data.get('value', [])
             
             # Add timestamp and process coordinates
-            timestamp = datetime.now().isoformat()
+            timestamp = datetime.utcnow().isoformat()
+            ingestion_time = datetime.utcnow().isoformat()
+            processing_time = datetime.utcnow().isoformat()
             for carpark in carparks:
                 # Add timestamp
                 carpark['timestamp'] = timestamp
+                # BigQuery raw table requires these fields (TIMESTAMP, REQUIRED)
+                carpark['ingestion_time'] = ingestion_time
+                carpark['processing_time'] = processing_time
                 
                 # Parse location coordinates
                 if 'Location' in carpark:
@@ -92,17 +108,21 @@ def lta_carpark_pipeline():
             
             # Connect to GCS and store data - organize data with date folders
             client = storage.Client()
-            bucket = client.get_bucket("lta-carpark")
+            bucket = client.get_bucket(BUCKET_NAME)
             blob = bucket.blob(f"carpark-data/{day_folder}/{filename}")
             
             # Write JSON formatted data, one record per line
             json_lines = '\n'.join([json.dumps(record) for record in carparks])
             blob.upload_from_string(json_lines)
             
-            logging.info(f"Successfully fetched and wrote {len(carparks)} carpark records to GCS: gs://lta-carpark/carpark-data/{day_folder}/{filename}")
+            logging.info(f"Successfully fetched and wrote {len(carparks)} carpark records to GCS: gs://{BUCKET_NAME}/carpark-data/{day_folder}/{filename}")
             
             # Return current date folder for next task
-            return day_folder
+            return {
+                "day_folder": day_folder,
+                "blob_name": f"carpark-data/{day_folder}/{filename}",
+                "gcs_uri": f"gs://{BUCKET_NAME}/carpark-data/{day_folder}/{filename}",
+            }
             
         except Exception as e:
             logging.error(f"API request or save to GCS failed: {str(e)}")
@@ -127,7 +147,7 @@ def lta_carpark_pipeline():
         
         # Upload to GCS
         client = storage.Client()
-        bucket = client.bucket("lta-carpark")
+        bucket = client.bucket(BUCKET_NAME)
         blob = bucket.blob("scripts/transform.js")
         blob.upload_from_string(transform_script)
         
@@ -143,7 +163,9 @@ def lta_carpark_pipeline():
                 {"name": "Longitude", "type": "FLOAT", "mode": "NULLABLE"},
                 {"name": "AvailableLots", "type": "INTEGER", "mode": "NULLABLE"},
                 {"name": "LotType", "type": "STRING", "mode": "NULLABLE"},
-                {"name": "Agency", "type": "STRING", "mode": "NULLABLE"}
+                {"name": "Agency", "type": "STRING", "mode": "NULLABLE"},
+                {"name": "ingestion_time", "type": "TIMESTAMP", "mode": "REQUIRED"},
+                {"name": "processing_time", "type": "TIMESTAMP", "mode": "REQUIRED"}
             ]
         }
         
@@ -152,43 +174,60 @@ def lta_carpark_pipeline():
         schema_blob.upload_from_string(json.dumps(schema_json))
         
         return {
-            "transform_path": "gs://lta-carpark/scripts/transform.js",
-            "schema_path": "gs://lta-carpark/schemas/carpark_schema.json"
+            "transform_path": f"gs://{BUCKET_NAME}/scripts/transform.js",
+            "schema_path": f"gs://{BUCKET_NAME}/schemas/carpark_schema.json"
         }
     
     # Step 3: Use Dataflow template to load GCS data to BigQuery
     @task(task_id="start_gcs_to_bigquery", retries=5, retry_delay=timedelta(minutes=2))
-    def start_gcs_to_bigquery(script_paths, day_folder, **kwargs):
-        """Start Dataflow job to load from GCS to BigQuery"""
-        from airflow.providers.google.cloud.operators.dataflow import DataflowStartFlexTemplateOperator
-        
-        # Changed location to North America region
-        gcs_to_bigquery = DataflowStartFlexTemplateOperator(
-            task_id="gcs_to_bigquery_dataflow",
-            project_id="lta-caravailability",
-            location="northamerica-northeast2",  # Changed to North America region
-            wait_until_finished=False,  # Don't wait for completion to avoid Airflow resource issues
-            body={
-                "launchParameter": {
-                    "containerSpecGcsPath": "gs://dataflow-templates-northamerica-northeast2/latest/flex/GCS_Text_to_BigQuery_Flex",  # Updated template path
-                    "jobName": f"gcs-to-bq-job-{day_folder.replace('-', '')}",
-                    "parameters": {
-                        "javascriptTextTransformFunctionName": "transform",
-                        "javascriptTextTransformGcsPath": script_paths["transform_path"],
-                        "JSONPath": script_paths["schema_path"],
-                        "inputFilePattern": f"gs://lta-carpark/carpark-data/{day_folder}/*.json",  # Only process that day's data
-                        "outputTable": "lta-caravailability:carpark_raw.carpark_availability",
-                        "bigQueryLoadingTemporaryDirectory": "gs://lta-carpark/temp/",
-                        "tempLocation": "gs://lta-carpark/temp/",
-                        "numWorkers": "1",  # Use minimum workers
-                        "workerMachineType": "n1-standard-1"  # Use smaller machine type
-                    }
-                }
-            }
+    def start_gcs_to_bigquery(script_paths, target, **kwargs):
+        """
+        Load JSON Lines from GCS into BigQuery using BigQuery API.
+
+        Note:
+        - 專案原本使用 Dataflow Flex Template，但目前 template 在這個環境下反覆 JOB_STATE_FAILED。
+        - 我們改用 BigQuery 原生 load 測試資料管線是否正確（資料格式/權限/Schema）。
+        - 後續若要恢復 Dataflow，只要再把這段替換回原 operator 即可。
+        """
+        from google.cloud import bigquery, storage
+
+        bq_client = bigquery.Client(project=PROJECT_ID)
+        storage_client = storage.Client(project=PROJECT_ID)
+        table_ref = f"{PROJECT_ID}.carpark_raw.carpark_availability"
+
+        if not target or "gcs_uri" not in target:
+            raise ValueError("Missing target info from fetch_api_to_gcs (expected keys: gcs_uri)")
+
+        json_uris = [target["gcs_uri"]]
+
+        schema_fields = [
+            bigquery.SchemaField("timestamp", "TIMESTAMP", mode="REQUIRED"),
+            bigquery.SchemaField("CarParkID", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("Area", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("Development", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("Location", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("Latitude", "FLOAT", mode="NULLABLE"),
+            bigquery.SchemaField("Longitude", "FLOAT", mode="NULLABLE"),
+            bigquery.SchemaField("AvailableLots", "INTEGER", mode="NULLABLE"),
+            bigquery.SchemaField("LotType", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("Agency", "STRING", mode="NULLABLE"),
+            bigquery.SchemaField("ingestion_time", "TIMESTAMP", mode="REQUIRED"),
+            bigquery.SchemaField("processing_time", "TIMESTAMP", mode="REQUIRED"),
+        ]
+
+        job_config = bigquery.LoadJobConfig(
+            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+            schema=schema_fields,
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+            ignore_unknown_values=True,
         )
-        
-        # Execute job
-        return gcs_to_bigquery.execute(context=kwargs)
+
+        for uri in json_uris:
+            logging.info(f"Loading into {table_ref}: {uri}")
+            load_job = bq_client.load_table_from_uri(uri, table_ref, job_config=job_config)
+            load_job.result()  # wait for each file
+
+        return {"loaded_files": len(json_uris)}
     
     # Step 4: Clean duplicate data in BigQuery
     @task(task_id="clean_duplicate_data", trigger_rule="all_done")
@@ -198,14 +237,14 @@ def lta_carpark_pipeline():
         dedup_query = """
         -- Create a temporary table with distinct records
         CREATE OR REPLACE TEMP TABLE temp_deduped AS
-        SELECT DISTINCT * FROM `lta-caravailability.carpark_raw.carpark_availability`;
+        SELECT DISTINCT * FROM `lta-carpark-489300.carpark_raw.carpark_availability`;
 
         -- Delete all records from the partitioned table
-        DELETE FROM `lta-caravailability.carpark_raw.carpark_availability` 
+        DELETE FROM `lta-carpark-489300.carpark_raw.carpark_availability` 
         WHERE TRUE;
 
         -- Insert the deduplicated records back
-        INSERT INTO `lta-caravailability.carpark_raw.carpark_availability`
+        INSERT INTO `lta-carpark-489300.carpark_raw.carpark_availability`
         SELECT * FROM temp_deduped;
         """
         
@@ -213,19 +252,20 @@ def lta_carpark_pipeline():
             task_id="clean_duplicates_in_bigquery",
             sql=dedup_query,
             use_legacy_sql=False,
-            location="asia-southeast1",  # BigQuery location remains the same
+            location=REGION,
         )
         
         return clean_task.execute(context=kwargs)
-    
+
     # Define task dependencies
-    day_folder = fetch_api_to_gcs()
+    # (XCom target info returned from fetch_api_to_gcs)
+    target = fetch_api_to_gcs()
     transform_files = prepare_transform_script()
-    load_to_bq = start_gcs_to_bigquery(transform_files, day_folder)
+    load_to_bq = start_gcs_to_bigquery(transform_files, target)
     clean_duplicates = clean_duplicate_data()
-    
+
     # Set task order
-    day_folder >> transform_files >> load_to_bq >> clean_duplicates
+    target >> transform_files >> load_to_bq >> clean_duplicates
 
 # Instantiate DAG
 carpark_dag = lta_carpark_pipeline()

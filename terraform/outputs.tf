@@ -20,11 +20,11 @@ output "dataflow_job_file" {
 }
 
 output "temp_location" {
-  value       = "${google_storage_bucket.carpark_bucket.name}/temp"
+  value       = "gs://${google_storage_bucket.carpark_bucket.name}/temp/"
   description = "The GCS temp location for Dataflow jobs"
 }
 
 output "staging_location" {
-  value       = "${google_storage_bucket.carpark_bucket.name}/staging"
+  value       = "gs://${google_storage_bucket.carpark_bucket.name}/staging/"
   description = "The GCS staging location for Dataflow jobs"
 }

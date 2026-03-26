@@ -11,12 +11,13 @@ x-airflow-common:
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW_HOME: /opt/airflow
-    GOOGLE_APPLICATION_CREDENTIALS: /opt/airflow/keys/lta-caravailability-a3190b400d81.json
+    GOOGLE_APPLICATION_CREDENTIALS: /opt/airflow/keys/lta-carpark-489300-b7f39e2b0b2b.json
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
-    - ./terraform/keys:/opt/airflow/keys
+    # 使用專案根目錄的 terraform/keys，金鑰檔請放在該目錄，檔名與下方 GOOGLE_APPLICATION_CREDENTIALS 一致
+    - ../terraform/keys:/opt/airflow/keys
   depends_on:
     - postgres
   user: "${AIRFLOW_UID:-50000}:${AIRFLOW_GID:-50000}"

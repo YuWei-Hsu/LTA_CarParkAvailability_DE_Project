@@ -1,24 +1,24 @@
 variable "credentials" {
     description = "GCP Credentials"
-    # Replace with your credential path
-    default = "./keys/lta-caravailability-a3190b400d81.json"
+    # Service account key file path (relative to terraform/)
+    default = "./keys/lta-carpark-489300-b7f39e2b0b2b.json"
 }
 
 variable "project" {
     description = "GCP Project ID"
-    # Replace with your project ID
-    default = "lta-caravailability"
+    # From your service account key: project_id
+    default = "lta-carpark-489300"
 }
 
 variable "region" {
     description = "GCP Region"
     # Replace with your location
-    default = "asia-southeast1"
+    default = "us-west1"
 }
 
 variable "location" {
     description = "Data Location"
-    default = "asia-southeast1"
+    default = "us-west1"
 }
 
 variable "raw_dataset_name" {
@@ -33,8 +33,8 @@ variable "processed_dataset_name" {
 
 variable "gcs_bucket_name" {
     description = "Data Lake Bucket Name"
-    # bucket name
-    default = "lta-carpark"
+    # Bucket name must be globally unique
+    default = "lta-carpark-489300"
 }
 
 variable "gcs_storage_class" {

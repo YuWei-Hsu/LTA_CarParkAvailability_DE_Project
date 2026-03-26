@@ -2,7 +2,7 @@
 
 # Configuration variable
 PROJECT_ID="lta-caravailability"
-REGION="asia-southeast1"
+REGION="us-west1"
 JOB_NAME="carpark-kafka-to-gcs-$(date +%Y%m%d-%H%M%S)"  # Add a timestamp to avoid duplicate names.
 BUCKET_NAME="lta-carpark"
 KAFKA_SERVER="localhost:9092"  # Local Kafka address
